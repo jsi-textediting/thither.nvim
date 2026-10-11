@@ -1,0 +1,130 @@
+*thither.txt*   Remote text editing and multi-GB large file viewing for Neovim
+
+==============================================================================
+CONTENTS                                                     *thither-contents*
+
+    1. Introduction ............................... |thither-introduction|
+    2. Large File Subsystem ....................... |thither-large-file|
+    3. Commands ................................... |thither-commands|
+    4. Keymaps & Navigation ....................... |thither-keymaps|
+    5. Configuration .............................. |thither-config|
+    6. URI Format ................................. |thither-uri|
+
+==============================================================================
+1. INTRODUCTION                                           *thither-introduction*
+
+|thither.nvim| is a Neovim client for `thither-server`, a standalone remote
+editing server spoken to over plain SSH stdio using length-prefixed
+MessagePack framing.
+
+Unlike traditional remote editing plugins that struggle with large files,
+`thither.nvim` is designed with FIRST-CLASS PRIORITY on large-file handling:
+it can open, navigate, search, and edit multi-gigabyte files on remote hosts in
+milliseconds without downloading the file or exhausting editor memory.
+
+==============================================================================
+2. LARGE FILE SUBSYSTEM                                     *thither-large-file*
+
+When a file size exceeds `large_file_threshold` (default 10 MB), or when opened
+via `:ThitherLargeEdit`, `thither.nvim` automatically enters Large File Mode:
+
+* INSTANT OPEN: Queries the server's `lineindex` to obtain line and chunk
+  partitions in milliseconds. Only the initial screen/viewport window is fetched.
+* O(1) MEMORY USAGE: Neovim buffers only the active window (e.g. 5,000 lines),
+  so a 10 GB file uses no more RAM than a 100 KB file.
+* FAST NAVIGATION: Jump to any line in O(log N) chunks with `:ThitherGoto <line>`
+  or by percentage with `:ThitherGoto <percent>%`.
+* SERVER-SIDE SEARCH: Run PCRE2 or literal searches directly on the server with
+  `:ThitherSearch <pattern>`. Matches stream into Neovim's Quickfix list, and
+  selecting any match instantly moves the viewport window to that line.
+* ATOMIC EDITS: When you modify the buffer window and run `:write`, `thither.nvim`
+  computes an `apply_edit` script containing only kept byte ranges and the new
+  string inserts. The remote server reassembles and commits the edit atomically.
+
+==============================================================================
+3. COMMANDS                                                   *thither-commands*
+
+:ThitherEdit {path_or_uri}                                         *:ThitherEdit*
+    Opens a remote file or directory. Accepts `thither://host/path` or `host:/path`.
+
+:ThitherLargeEdit {path_or_uri}                               *:ThitherLargeEdit*
+    Forces opening the file in Large File Viewport Mode, regardless of size.
+
+:ThitherGoto {target}                                              *:ThitherGoto*
+    Jumps to a line number or percentage in the active large file buffer.
+    Examples:
+        :ThitherGoto 2500000
+        :ThitherGoto 75%
+
+:ThitherPageNext                                                *:ThitherPageNext*
+    Scrolls the viewport window forward.
+
+:ThitherPagePrev                                                *:ThitherPagePrev*
+    Scrolls the viewport window backward.
+
+:ThitherSearch {pattern}                                         *:ThitherSearch*
+    Executes a high-speed literal search across the entire file on the remote server
+    and populates Neovim's Quickfix list.
+
+:ThitherSearchRegex {pattern}                               *:ThitherSearchRegex*
+    Executes a high-speed PCRE2 regex search on the remote server.
+
+:ThitherConnect {host}                                          *:ThitherConnect*
+    Pre-connects to a remote host and verifies server status.
+
+:ThitherDisconnect [{host}]                                  *:ThitherDisconnect*
+    Disconnects from the given host or all remote sessions.
+
+:ThitherStatus                                                   *:ThitherStatus*
+    Displays remote status and large file window information.
+
+==============================================================================
+4. KEYMAPS & NAVIGATION                                        *thither-keymaps*
+
+Inside a Large File Viewport buffer:
+    ]p          Page forward
+    [p          Page backward
+
+Inside a Remote Directory buffer:
+    <CR>        Open file or navigate into directory
+    -           Navigate up to parent directory
+    R           Refresh directory listing
+    q           Close directory buffer
+
+==============================================================================
+5. CONFIGURATION                                                *thither-config*
+
+Configure `thither.nvim` in your `init.lua`:
+>lua
+    require("thither").setup({
+      -- Remote server executable
+      server_path = "thither-server",
+
+      -- Large file options [PRIORITY]
+      large_file_threshold = 10 * 1024 * 1024, -- 10 MB
+      window_size_lines = 5000,                -- Lines per viewport window
+      enable_winbar = true,                    -- Show status in winbar
+
+      -- SSH options
+      ssh_command = { "ssh", "-T" },
+
+      -- Per-host overrides
+      hosts = {
+        devbox = {
+          port = 2222,
+          identity = "~/.ssh/id_rsa",
+        },
+      },
+    })
+<
+
+==============================================================================
+6. URI FORMAT                                                      *thither-uri*
+
+`thither.nvim` supports standard URI forms:
+
+    thither://[user@]host[:port]/path/to/file
+    thither://local:/path/to/file
+    [user@]host:/path/to/file
+
+vim:tw=78:ts=8:ft=help:norl:
