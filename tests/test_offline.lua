@@ -487,4 +487,140 @@ test("client fails pending requests on unmatched error frames, protocol errors, 
   assert_eq(c3.last_error.code, "closed", "last_error set on exit")
 end)
 
+test("build_cmd: --session after --stdio in every transport; plink takes -P", function()
+  local transport = require("thither.transport")
+  local saved = vim.deepcopy(config.values)
+  config.values.server_args = { "--root", "/srv" }
+  config.values.hosts = {
+    ["local:"] = { session = "s1" },
+    ["wsl:Ubuntu"] = { session = true },
+    ["box"] = { session = "proj.a-1", port = 2222 },
+    ["pbox"] = { ssh_command = { "C:/Tools/PuTTY/PLINK.EXE", "-batch", "-T" }, port = 2200 },
+    ["bad"] = { session = "no spaces" },
+    ["long"] = { session = string.rep("x", 33) },
+  }
+  local cmd, args = transport.build_cmd("local:")
+  assert_eq(cmd, "thither-server", "local cmd")
+  assert_eq(table.concat(args, " "), "--stdio --session s1 --root /srv", "local args")
+  cmd, args = transport.build_cmd("wsl:Ubuntu")
+  assert_eq(table.concat(args, " "), "-d Ubuntu -e thither-server --stdio --session default --root /srv", "wsl args")
+  cmd, args = transport.build_cmd("box")
+  assert_eq(cmd, "ssh", "ssh cmd")
+  assert_eq(table.concat(args, " "), "-T -p 2222 box thither-server --stdio --session proj.a-1 --root /srv", "ssh args")
+  cmd, args = transport.build_cmd("pbox")
+  assert_eq(table.concat(args, " "), "-batch -T -P 2200 pbox thither-server --stdio --root /srv", "plink -P, no session")
+  config.values.hosts["u@pbox:2201"] = { ssh_command = { "/usr/bin/plink", "-batch" } }
+  cmd, args = transport.build_cmd("u@pbox:2201")
+  assert_eq(table.concat(args, " "), "-batch -P 2201 u@pbox thither-server --stdio --root /srv", "plink by basename (u@host:port)")
+  cmd, args = transport.build_cmd("other")
+  assert_eq(table.concat(args, " "), "-T other thither-server --stdio --root /srv", "no session option")
+  local ok, err = pcall(transport.build_cmd, "bad")
+  assert_eq(ok, false, "invalid name refused")
+  assert_eq(tostring(err):find("Invalid session name", 1, true) ~= nil, true, "error names the problem")
+  assert_eq(pcall(transport.build_cmd, "long"), false, "33-character name refused")
+  config.values = saved
+end)
+
+test("session notices on hello: skew, restart, same pid, old server", function()
+  local saved = vim.deepcopy(config.values)
+  config.values.hosts = { ["sess"] = { session = "work" }, ["plain"] = {} }
+  local notes = {}
+  local orig_notify = vim.notify
+  vim.notify = function(m, lvl) notes[#notes + 1] = { msg = m, level = lvl } end
+  local function hello(spec, session, extra)
+    local c = Client.new(spec)
+    c.state = "connecting"
+    local h = { ev = "hello", proto_version = 1, server_version = "2.1.7", build_id = "bbbb",
+                caps = { "fs", "session" }, session = session }
+    for k, v in pairs(extra or {}) do h[k] = v end
+    c:_handle_message(h)
+    vim.wait(50, function() return false end)
+    assert_eq(c.state, "ready", "hello accepted")
+    return c
+  end
+  local function take()
+    local n = notes
+    notes = {}
+    return n
+  end
+  local function S(pid, skew)
+    return { name = "work", daemon_pid = pid, started = 1, version = "2.1.7", version_skew = skew,
+             plugins = {}, connections = 1 }
+  end
+
+  hello("sess", S(100))
+  assert_eq(#take(), 0, "first hello: no notice")
+  hello("sess", S(100))
+  assert_eq(#take(), 0, "reconnect to the same daemon: no notice")
+  hello("sess", S(200))
+  local n = take()
+  assert_eq(#n, 1, "pid change: one notice")
+  assert_eq(n[1].msg:find("session work was restarted (pid 100 → 200)", 1, true) ~= nil, true, "restart text")
+  assert_eq(n[1].level, vim.log.levels.WARN, "unexpected restart is a warning")
+  assert_eq(Client.session_pids["sess|work"], 200, "new pid remembered")
+  local other = S(900)
+  other.name = "other"
+  hello("sess", other)
+  assert_eq(#take(), 0, "another session name on the same host is no restart")
+
+  Client.session_restart_requested.sess = true
+  hello("sess", S(300))
+  n = take()
+  assert_eq(#n, 1, "requested restart: one notice")
+  assert_eq(n[1].msg:find("restarted as requested (pid 200 → 300)", 1, true) ~= nil, true, "requested wording")
+  assert_eq(Client.session_restart_requested.sess, nil, "request flag cleared")
+
+  hello("sess", S(300, "2.1.8 (cccc)"))
+  n = take()
+  assert_eq(#n, 1, "skew: one notice")
+  assert_eq(n[1].msg:find("remote session work runs thither-server 2.1.7 (bbbb), installed is 2.1.8 (cccc); restart the session to upgrade", 1, true) ~= nil, true, "skew text: " .. n[1].msg)
+  hello("sess", S(300, "2.1.8 (cccc)"))
+  assert_eq(#take(), 0, "skew: once per host and daemon")
+  hello("sess", S(400, "2.1.8 (cccc)"))
+  n = take()
+  assert_eq(#n, 2, "new daemon with skew: restart + skew notice")
+
+  hello("sess", nil)
+  n = take()
+  assert_eq(#n, 1, "old server: one notice")
+  assert_eq(n[1].msg:find("has no session support", 1, true) ~= nil, true, "old-server text")
+  hello("sess", nil)
+  assert_eq(#take(), 0, "old server: warned once")
+  hello("plain", nil)
+  assert_eq(#take(), 0, "no session option, no session table: silent")
+
+  -- session_closing event
+  local c = hello("sess", S(400))
+  take()
+  c:_handle_message({ ev = "session_closing" })
+  vim.wait(50, function() return false end)
+  n = take()
+  assert_eq(#n, 1, "session_closing logged")
+  assert_eq(n[1].msg:find("remote session work is shutting down", 1, true) ~= nil, true, "closing text")
+
+  vim.notify = orig_notify
+  config.values = saved
+  Client.session_pids = {}
+  Client.session_warned = { skew = {}, old = {} }
+end)
+
+test("session commands refuse hosts without a session", function()
+  local thither = require("thither")
+  local saved = vim.deepcopy(config.values)
+  local info, err = thither.session_info("nosession")
+  assert_eq(info, nil, "no session option")
+  assert_eq(err:find("not in session mode", 1, true) ~= nil, true, "clear error: " .. err)
+  local ok, rerr = thither.restart_session("nosession")
+  assert_eq(ok, false, "restart refused")
+  assert_eq(rerr:find("not in session mode", 1, true) ~= nil, true, "clear restart error")
+  -- the fake server has no session cap
+  config.values.hosts = { [SPEC] = { session = true } }
+  fake.server_info = { server_version = "1.0" }
+  info, err = thither.session_info(SPEC)
+  assert_eq(info, nil, "server without session support")
+  assert_eq(err:find("no session support", 1, true) ~= nil, true, "old server error: " .. err)
+  fake.server_info = nil
+  config.values = saved
+end)
+
 print(string.format("  ✓ test_offline passed! (%d tests)", passed))

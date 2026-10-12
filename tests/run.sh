@@ -25,6 +25,14 @@ if [[ -x "$THITHER_SERVER" ]]; then
   THITHER_SERVER="$(native_path "$THITHER_SERVER")"
 fi
 
+# test_session.lua starts a session daemon: keep its socket, lock and log in
+# temporary directories instead of the real XDG ones
+XDG_TMP="$(mktemp -d)"
+trap 'rm -rf "$XDG_TMP"' EXIT
+mkdir "$XDG_TMP/run" "$XDG_TMP/state"
+chmod 700 "$XDG_TMP/run" "$XDG_TMP/state" 2>/dev/null || true  # no-op on Windows
+export XDG_RUNTIME_DIR="$XDG_TMP/run" XDG_STATE_HOME="$XDG_TMP/state"
+
 echo "=========================================="
 echo " Running thither.nvim test suite          "
 echo "=========================================="
@@ -38,6 +46,7 @@ server_tests=(
   "tests/test_vfs.lua"
   "tests/test_large_file.lua"
   "tests/test_integration.lua"
+  "tests/test_session.lua"
 )
 
 failed=0

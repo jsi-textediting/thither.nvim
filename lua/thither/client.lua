@@ -9,6 +9,20 @@ Client.__index = Client
 Client.PROTO_VERSION = 1
 Client.CLIENT_VERSION = "thither.nvim-0.1.0"
 Client.instances = {} -- spec -> Client
+-- Session state per host spec. Kept at module level so it survives the
+-- replacement of a dead Client instance by Client.get.
+Client.session_pids = {} -- "spec|session name" -> last seen session.daemon_pid
+Client.session_warned = { skew = {}, old = {} } -- "spec|pid" / spec -> true
+Client.session_restart_requested = {} -- spec -> true after :ThitherRestartSession
+
+--- Shows a non-blocking notice (vim.notify from the main loop).
+---@param msg string
+---@param level? integer
+local function notice(msg, level)
+  vim.schedule(function()
+    vim.notify("thither: " .. msg, level or vim.log.levels.WARN)
+  end)
+end
 
 --- Gets or creates a Client instance for the given host spec.
 ---@param spec string
@@ -196,6 +210,7 @@ function Client:_handle_message(msg)
         self.caps[cap] = true
       end
     end
+    self:_check_session(msg)
     self.state = "ready"
     self:_notify_ready(nil)
     self:_flush_queue()
@@ -218,6 +233,12 @@ function Client:_handle_message(msg)
 
   -- 3. Server event notification { ev, ... }
   if msg.ev ~= nil then
+    if msg.ev == "session_closing" then
+      local s = self.server_info and self.server_info.session
+      local name = type(s) == "table" and s.name or "?"
+      notice(string.format("%s: remote session %s is shutting down", self.spec, tostring(name)),
+        vim.log.levels.INFO)
+    end
     local listeners = self.event_listeners[msg.ev]
     if listeners then
       for _, fn in ipairs(listeners) do
@@ -240,6 +261,53 @@ function Client:_handle_message(msg)
       self:_teardown()
     end
   end
+end
+
+--- Session notices for a hello reply: version skew (once per host and
+--- daemon), an old server without sessions (once per host), and a daemon_pid
+--- that changed since the last connection to this host.
+---@param msg table hello reply
+function Client:_check_session(msg)
+  local spec = self.spec
+  local s = msg.session
+  if type(s) ~= "table" then
+    local ok, want = pcall(transport.session_name, spec)
+    if ok and want and not Client.session_warned.old[spec] then
+      Client.session_warned.old[spec] = true
+      notice(string.format("%s: session %s requested, but thither-server %s has no session support; "
+        .. "running without a session", spec, want, tostring(msg.server_version)))
+    end
+    return
+  end
+  local name = tostring(s.name)
+  local pid = s.daemon_pid
+  local skew = s.version_skew
+  if skew ~= nil and skew ~= vim.NIL then
+    local key = spec .. "|" .. tostring(pid)
+    if not Client.session_warned.skew[key] then
+      Client.session_warned.skew[key] = true
+      local running = tostring(s.version)
+      if type(msg.build_id) == "string" and msg.build_id ~= "" then
+        running = running .. " (" .. msg.build_id .. ")"
+      end
+      notice(string.format("%s: remote session %s runs thither-server %s, installed is %s; "
+        .. "restart the session to upgrade (:ThitherRestartSession, this ends its terminals)",
+        spec, name, running, tostring(skew)))
+    end
+  end
+  -- keyed by name too: switching a host to another session is no restart
+  local pid_key = spec .. "|" .. name
+  local prev = Client.session_pids[pid_key]
+  local requested = Client.session_restart_requested[spec]
+  Client.session_restart_requested[spec] = nil
+  if prev ~= nil and pid ~= nil and prev ~= pid and requested then
+    notice(string.format("%s: session %s was restarted as requested (pid %s → %s)",
+      spec, name, tostring(prev), tostring(pid)), vim.log.levels.INFO)
+  elseif prev ~= nil and pid ~= nil and prev ~= pid then
+    notice(string.format("%s: session %s was restarted (pid %s → %s); open files are unaffected, "
+      .. "its terminals and jobs are gone", spec, name, tostring(prev), tostring(pid)))
+  end
+  if pid ~= nil then Client.session_pids[pid_key] = pid end
 end
 
 --- Fails all in-flight and queued requests with `err`.

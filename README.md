@@ -14,7 +14,7 @@ A high-performance remote editing package for **Neovim** powered by [`thither-se
 * **✏️ Atomic In-Window Saving**: Edits in the viewport window are committed via `apply_edit` scripts (kept byte ranges + inserts). Only the edited text crosses the wire—no full file uploads!
 * **🛡️ Conflict Detection**: ETag verification prevents accidental overwrites when a remote file is modified externally.
 * **📁 Built-in Directory Browser**: Seamlessly browse and open remote directories.
-* **🔌 Zero Background Daemons**: Connects over standard SSH stdio (`ssh -T`) or local/WSL processes without needing open network ports.
+* **🔌 No Open Ports**: Connects over standard SSH stdio (`ssh -T`) or local/WSL processes without needing open network ports; an opt-in `session` keeps a per-user daemon across reconnects.
 
 ---
 
@@ -90,8 +90,13 @@ require("thither").setup({
   -- Additional flags passed to the server
   server_args = {},
 
-  -- Base SSH command
+  -- Base SSH command (with PuTTY's plink, `port` is passed as -P)
   ssh_command = { "ssh", "-T" },
+
+  -- Persistent remote session: nil = a fresh server per connection,
+  -- true = session "default", or a name ([A-Za-z0-9._-], max 32 chars).
+  -- Runs the server as `thither-server --stdio --session NAME`.
+  session = nil,
 
   -- Large file subsystem options [PRIORITY]
   large_file_threshold = 10 * 1024 * 1024, -- 10 MB (auto-triggers Large File Mode)
@@ -108,10 +113,26 @@ require("thither").setup({
       port = 2222,
       identity = "~/.ssh/id_ed25519",
       user = "deploy",
+      session = "work",
     },
   },
 })
 ```
+
+### Sessions
+
+With `session` set for a host, a dropped connection (network, killed ssh)
+reconnects to the same remote daemon on the next operation. Notices tell you
+when the daemon runs another thither-server version than the one installed
+(once per daemon), when the session was restarted (its pid changed), and when
+the server has no session support.
+
+* `:ThitherSessionInfo [host]`: name, daemon pid, start time, version, skew,
+  connections and plugins of the host's session.
+* `:ThitherRestartSession [host]`: after a confirmation, ends the session and
+  disconnects; the next operation starts a new daemon. Use it to upgrade after
+  a version skew notice. Open files are unaffected; the session's terminals
+  and jobs end with it.
 
 ---
 

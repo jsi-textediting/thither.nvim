@@ -78,6 +78,20 @@ via `:ThitherLargeEdit`, `thither.nvim` automatically enters Large File Mode:
 :ThitherStatus                                                   *:ThitherStatus*
     Displays remote status and large file window information.
 
+:ThitherSessionInfo [{host}]                                *:ThitherSessionInfo*
+    Shows the remote session of {host} (default: the current buffer's host,
+    or the only connected host): name, daemon pid, start time, version,
+    version skew, connections and plugins. Fails if the host has no
+    `session` option or its server has no session support.
+
+:ThitherRestartSession [{host}]                          *:ThitherRestartSession*
+    After a confirmation, ends the remote session of {host}
+    (`session_shutdown`) and disconnects. The next operation on the host
+    starts a new session daemon and reports "session NAME was restarted as
+    requested (pid A → B)". Open files are unaffected; the session's
+    terminals and jobs end with it. Use it to upgrade a session after a
+    version skew notice.
+
 ==============================================================================
 4. KEYMAPS & NAVIGATION                                        *thither-keymaps*
 
@@ -108,15 +122,36 @@ Configure `thither.nvim` in your `init.lua`:
       -- SSH options
       ssh_command = { "ssh", "-T" },
 
+      -- Persistent remote session (see |thither-session|)
+      session = nil,
+
       -- Per-host overrides
       hosts = {
         devbox = {
           port = 2222,
           identity = "~/.ssh/id_rsa",
+          session = true,
         },
       },
     })
 <
+                                                              *thither-session*
+`session` (default nil) makes the host's server a persistent per-user session
+daemon: `--session NAME` is passed right after `--stdio`, for ssh, `wsl:` and
+`local:` hosts alike. `true` means the session "default"; a string names it
+([A-Za-z0-9._-], at most 32 characters, checked before connecting). A
+connection that drops (network, killed ssh) reconnects to the same daemon on
+the next operation. Notices (non-blocking, |vim.notify()|):
+* the daemon runs another thither-server version or build than the one
+  installed: once per host and daemon. Restart the session to upgrade
+  (|:ThitherRestartSession|).
+* the daemon pid changed since the last connection: the session was
+  restarted. Files are unaffected (etag checks), its terminals and jobs
+  are gone.
+* `session` is set but the server has no session support: once per host.
+* the server sends `session_closing`: the session is shutting down.
+
+With PuTTY's plink as `ssh_command`, `port` is passed as `-P`.
 
 ==============================================================================
 6. URI FORMAT                                                      *thither-uri*

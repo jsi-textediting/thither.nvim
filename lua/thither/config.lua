@@ -6,6 +6,11 @@ M.defaults = {
   server_path = "thither-server",
   server_args = {},
 
+  -- Persistent remote session: nil (default) runs a fresh server per
+  -- connection; true means session "default"; a string names the session
+  -- ([A-Za-z0-9._-], at most 32 characters). Passed as --session NAME.
+  session = nil,
+
   -- SSH command and defaults
   ssh_command = { "ssh", "-T" },
   port = nil,
