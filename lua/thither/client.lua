@@ -1,5 +1,4 @@
 --- Client connection and request multiplexer for thither-server protocol v1.
-local uv = vim.uv
 local frame = require("thither.frame")
 local transport = require("thither.transport")
 local config = require("thither.config")
@@ -34,6 +33,25 @@ function Client.get(spec, cb)
   return client
 end
 
+--- Returns a ready Client for `spec`, (re)connecting and blocking until the
+--- handshake finished. A client whose connection died is replaced by a new one.
+---@param spec string
+---@param timeout_ms? integer
+---@return table|nil client, table|nil err
+function Client.ensure(spec, timeout_ms)
+  local client = Client.get(spec)
+  if not client:is_ready() then
+    local timeout = timeout_ms or (config.get("timeout_seconds", spec) * 1000)
+    vim.wait(timeout, function()
+      return client.state ~= "connecting"
+    end, 10)
+    if not client:is_ready() then
+      return nil, client.last_error or { code = "timeout", msg = "Timed out connecting to " .. spec }
+    end
+  end
+  return client
+end
+
 --- Creates a new Client instance.
 ---@param spec string
 ---@return table
@@ -51,6 +69,7 @@ function Client.new(spec)
     caps = {},
     stderr_tail = "",
     last_error = nil,
+    exited = false,
   }, Client)
   return self
 end
@@ -100,7 +119,7 @@ function Client:_start_reading()
     end
     if data then
       self.reader:feed(data)
-      while true do
+      while self.state == "connecting" or self.state == "ready" do
         local msg, err_code, err_detail = self.reader:next()
         if not msg then
           if err_code then
@@ -108,23 +127,32 @@ function Client:_start_reading()
           end
           break
         end
+        if type(msg) ~= "table" then
+          -- every payload is a map; anything else means a broken stream
+          self:_handle_protocol_error("bad_frame", "server sent a non-map payload")
+          break
+        end
         self:_handle_message(msg)
       end
     end
   end)
 
-  self.proc.stderr:read_start(function(err, data)
+  self.proc.stderr:read_start(function(_, data)
     if data then
       self.stderr_tail = (self.stderr_tail .. data):sub(-4096)
     end
   end)
 end
 
+---@return boolean sent, table|nil err
 function Client:_send(msg)
   if not self.proc or not self.proc.stdin or self.proc.stdin:is_closing() then
     return false
   end
-  local encoded = frame.encode(msg)
+  local ok, encoded = pcall(frame.encode, msg)
+  if not ok then
+    return false, { code = "too_large", msg = tostring(encoded) }
+  end
   self.proc.stdin:write(encoded)
   return true
 end
@@ -145,6 +173,7 @@ function Client:_handle_message(msg)
     if msg.err then
       self.state = "error"
       self.last_error = msg.err
+      self:_fail_pending(msg.err)
       self:_notify_ready(msg.err)
       return
     end
@@ -154,7 +183,9 @@ function Client:_handle_message(msg)
         code = "version_mismatch",
         msg = string.format("Server protocol %s != client %s", tostring(msg.proto_version), Client.PROTO_VERSION),
       }
+      self:_fail_pending(self.last_error)
       self:_notify_ready(self.last_error)
+      self:_teardown()
       return
     end
 
@@ -172,7 +203,7 @@ function Client:_handle_message(msg)
   end
 
   -- 2. Request response { id, ok } or { id, err }
-  if msg.id ~= nil then
+  if msg.id ~= nil and msg.ev == nil then
     local p = self.pending[msg.id]
     if p then
       self.pending[msg.id] = nil
@@ -195,6 +226,65 @@ function Client:_handle_message(msg)
     end
     return
   end
+
+  -- 4. Error frame without id ({err={code="bad_frame"|"frame_too_large"|...}}).
+  -- It cannot be matched to a request, so every in-flight request is failed
+  -- instead of being left to time out.
+  if type(msg.err) == "table" then
+    local err = { code = msg.err.code or "bad_frame", msg = tostring(msg.err.msg or msg.err.code) }
+    self.last_error = err
+    self:_fail_pending(err)
+    if self.state == "connecting" then
+      self.state = "error"
+      self:_notify_ready(err)
+      self:_teardown()
+    end
+  end
+end
+
+--- Fails all in-flight and queued requests with `err`.
+---@param err table
+function Client:_fail_pending(err)
+  local pending = self.pending
+  self.pending = {}
+  for _, p in pairs(pending) do
+    if p.cb then
+      vim.schedule(function() p.cb(nil, err) end)
+    end
+  end
+  local q = self.queue
+  self.queue = {}
+  for _, item in ipairs(q) do
+    if item.cb then
+      vim.schedule(function() item.cb(nil, err) end)
+    end
+  end
+end
+
+--- Closes the pipes and the process handle (idempotent).
+function Client:_teardown()
+  local proc = self.proc
+  if not proc then return end
+  for _, h in ipairs({ proc.stdin, proc.stdout, proc.stderr }) do
+    if h and not h:is_closing() then
+      h:close()
+    end
+  end
+  if proc.handle and not proc.handle:is_closing() then
+    if not self.exited then pcall(proc.handle.kill, proc.handle, "sigterm") end
+    proc.handle:close()
+  end
+end
+
+--- Appends the tail of the server's stderr to an error message.
+---@param msg string
+---@return string
+function Client:_with_stderr(msg)
+  local tail = vim.trim(self.stderr_tail or "")
+  if tail ~= "" then
+    return msg .. ": " .. tail:sub(-1000)
+  end
+  return msg
 end
 
 function Client:_notify_ready(err)
@@ -214,33 +304,49 @@ function Client:_flush_queue()
 end
 
 function Client:_handle_exit(code, signal)
-  self.state = "closed"
-  local err = { code = "closed", msg = string.format("Server exited with code %s (signal %s)", tostring(code), tostring(signal)) }
-  for id, p in pairs(self.pending) do
-    self.pending[id] = nil
-    if p.cb then
-      vim.schedule(function() p.cb(nil, err) end)
+  self.exited = true
+  -- The exit callback can run before the last stdout/stderr bytes were
+  -- delivered (e.g. a version_mismatch hello followed by exit 2); let the
+  -- loop drain them before failing requests and closing the pipes.
+  vim.schedule(function()
+    if self.state == "connecting" or self.state == "ready" then
+      self.state = "closed"
+      self.last_error = {
+        code = "closed",
+        msg = self:_with_stderr(string.format("Server exited with code %s (signal %s)", tostring(code), tostring(signal))),
+      }
     end
-  end
-  self:_notify_ready(err)
+    local err = self.last_error or { code = "closed", msg = "Server exited" }
+    self:_fail_pending(err)
+    self:_notify_ready(err)
+    self:_teardown()
+  end)
 end
 
 function Client:_handle_io_error(stream, err)
   self.state = "error"
-  self.last_error = { code = "io_error", msg = string.format("%s error: %s", stream, tostring(err)) }
+  self.last_error = { code = "io_error", msg = self:_with_stderr(string.format("%s error: %s", stream, tostring(err))) }
+  self:_fail_pending(self.last_error)
+  self:_notify_ready(self.last_error)
+  self:_teardown()
 end
 
 function Client:_handle_protocol_error(code, detail)
+  -- A framing error cannot be resynchronised: drop the connection.
   self.state = "error"
   self.last_error = { code = code, msg = tostring(detail) }
+  self:_fail_pending(self.last_error)
+  self:_notify_ready(self.last_error)
+  self:_teardown()
 end
 
 --- Sends an asynchronous request to the server.
 ---@param op string
 ---@param args table|nil
 ---@param cb fun(ok: any, err?: table)
+---@return integer|nil id
 function Client:call(op, args, cb)
-  if self.state == "closed" or self.state == "error" then
+  if self.state == "closed" or self.state == "error" or self.state == "idle" then
     if cb then
       vim.schedule(function()
         cb(nil, self.last_error or { code = "not_connected", msg = "Client is disconnected" })
@@ -262,7 +368,16 @@ function Client:call(op, args, cb)
   local msg = { id = id, op = op, args = req_args }
 
   self.pending[id] = { cb = cb, op = op }
-  self:_send(msg)
+  local sent, send_err = self:_send(msg)
+  if not sent then
+    self.pending[id] = nil
+    if cb then
+      local err = send_err or self.last_error or { code = "not_connected", msg = "Client is disconnected" }
+      vim.schedule(function() cb(nil, err) end)
+    end
+    return
+  end
+  return id
 end
 
 --- Sends a synchronous request, blocking Neovim until response or timeout.
@@ -272,7 +387,7 @@ end
 ---@return any ok, table|nil err
 function Client:call_sync(op, args, timeout_ms)
   local res, err, done = nil, nil, false
-  self:call(op, args, function(r, e)
+  local id = self:call(op, args, function(r, e)
     res = r
     err = e
     done = true
@@ -281,6 +396,7 @@ function Client:call_sync(op, args, timeout_ms)
   local timeout = timeout_ms or (config.get("timeout_seconds", self.spec) * 1000)
   local wait_ok = vim.wait(timeout, function() return done end, 5)
   if not wait_ok then
+    if id then self:cancel(id) end
     return nil, { code = "timeout", msg = string.format("Request '%s' timed out after %d ms", op, timeout) }
   end
   return res, err
@@ -315,13 +431,13 @@ end
 --- Closes the client connection and child process.
 function Client:close()
   self.state = "closed"
-  if self.proc then
-    if self.proc.stdin and not self.proc.stdin:is_closing() then self.proc.stdin:close() end
-    if self.proc.stdout and not self.proc.stdout:is_closing() then self.proc.stdout:close() end
-    if self.proc.stderr and not self.proc.stderr:is_closing() then self.proc.stderr:close() end
-    if self.proc.handle and not self.proc.handle:is_closing() then self.proc.handle:close() end
+  self.last_error = { code = "closed", msg = "Connection closed by client" }
+  self:_fail_pending(self.last_error)
+  self:_notify_ready(self.last_error)
+  self:_teardown()
+  if Client.instances[self.spec] == self then
+    Client.instances[self.spec] = nil
   end
-  Client.instances[self.spec] = nil
 end
 
 return Client

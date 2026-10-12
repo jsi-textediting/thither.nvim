@@ -64,6 +64,10 @@ function M.open(bufnr, client, rpath, spec)
   -- Keymaps
   local opts = { buffer = bufnr, silent = true, nowait = true }
 
+  local function parent_uri()
+    return M.parent_uri(spec, rpath)
+  end
+
   local function open_current()
     local cursor = vim.api.nvim_win_get_cursor(0)
     local line_idx = cursor[1]
@@ -72,9 +76,7 @@ function M.open(bufnr, client, rpath, spec)
 
     if item.name == ".." then
       -- Go up
-      local parent = vim.fs.dirname(rpath:gsub("/$", "")) or "/"
-      local target_uri = string.format("thither://%s%s/", spec, parent)
-      vim.cmd("edit " .. vim.fn.fnameescape(target_uri))
+      vim.cmd("edit " .. vim.fn.fnameescape(parent_uri()))
     elseif item.is_dir then
       local target_uri = string.format("thither://%s%s%s/", spec, rpath, item.name)
       vim.cmd("edit " .. vim.fn.fnameescape(target_uri))
@@ -86,9 +88,7 @@ function M.open(bufnr, client, rpath, spec)
 
   vim.keymap.set("n", "<CR>", open_current, opts)
   vim.keymap.set("n", "-", function()
-    local parent = vim.fs.dirname(rpath:gsub("/$", "")) or "/"
-    local target_uri = string.format("thither://%s%s/", spec, parent)
-    vim.cmd("edit " .. vim.fn.fnameescape(target_uri))
+    vim.cmd("edit " .. vim.fn.fnameescape(parent_uri()))
   end, opts)
   vim.keymap.set("n", "R", function()
     M.open(bufnr, client, rpath, spec)
@@ -98,6 +98,18 @@ function M.open(bufnr, client, rpath, spec)
   end, opts)
 
   return true
+end
+
+--- URI of the parent directory of `rpath` (the root is its own parent).
+---@param spec string
+---@param rpath string
+---@return string
+function M.parent_uri(spec, rpath)
+  local trimmed = rpath:gsub("/+$", "")
+  local parent = trimmed ~= "" and vim.fs.dirname(trimmed) or "/"
+  if parent == "." or parent == "" then parent = "/" end
+  if parent:sub(-1) ~= "/" then parent = parent .. "/" end
+  return string.format("thither://%s%s", spec, parent)
 end
 
 return M

@@ -10,7 +10,7 @@ local buffer = require("thither.buffer")
 -- Register URL autocommands for thither://*
 local augroup = vim.api.nvim_create_augroup("thither_autocmds", { clear = true })
 
-vim.api.nvim_create_autocmd({ "BufReadCmd", "FileReadCmd" }, {
+vim.api.nvim_create_autocmd("BufReadCmd", {
   group = augroup,
   pattern = "thither://*",
   callback = function(ev)
@@ -18,11 +18,29 @@ vim.api.nvim_create_autocmd({ "BufReadCmd", "FileReadCmd" }, {
   end,
 })
 
+-- ":read thither://..." inserts into the current buffer
+vim.api.nvim_create_autocmd("FileReadCmd", {
+  group = augroup,
+  pattern = "thither://*",
+  callback = function(ev)
+    buffer.on_file_read(ev.match)
+  end,
+})
+
+-- ":w", ":w name", ":saveas name", ":N,Mw name": write to <amatch>
 vim.api.nvim_create_autocmd({ "BufWriteCmd", "FileWriteCmd" }, {
   group = augroup,
   pattern = "thither://*",
   callback = function(ev)
-    buffer.on_buf_write(ev.buf)
+    buffer.on_write(ev.buf, ev.match, ev.event)
+  end,
+})
+
+vim.api.nvim_create_autocmd("FileAppendCmd", {
+  group = augroup,
+  pattern = "thither://*",
+  callback = function()
+    vim.notify("Appending (:w >>) to thither files is not supported", vim.log.levels.ERROR)
   end,
 })
 
@@ -147,36 +165,6 @@ end, {
   desc = "Display remote status information for current buffer",
 })
 
--- Quickfix navigation synchronization for large files
-vim.api.nvim_create_autocmd("QuickfixCmdPost", {
-  group = augroup,
-  pattern = { "c*", "cfirst", "cnext", "cprev", "cc", "clast", "cr" },
-  callback = function()
-    local qf = vim.fn.getqflist({ idx = 0 })
-    if qf.idx > 0 then
-      local items = vim.fn.getqflist()
-      local item = items[qf.idx]
-      if item and item.bufnr and thither.large_file.buffers[item.bufnr] then
-        thither.large_file.goto_line(item.bufnr, item.lnum, item.col)
-      end
-    end
-  end,
-})
-
-vim.api.nvim_create_autocmd("FileType", {
-  group = augroup,
-  pattern = "qf",
-  callback = function(ev)
-    vim.keymap.set("n", "<CR>", function()
-      local line = vim.fn.line(".")
-      local items = vim.fn.getqflist()
-      local item = items[line]
-      if item and item.bufnr and thither.large_file.buffers[item.bufnr] then
-        vim.cmd("wincmd p")
-        thither.large_file.goto_line(item.bufnr, item.lnum, item.col)
-      else
-        vim.cmd("execute 'cc' " .. line)
-      end
-    end, { buffer = ev.buf, silent = true, desc = "Thither quickfix viewport jump" })
-  end,
-})
+-- Quickfix navigation (:cnext, :cc, <CR> in the quickfix window, ...) of
+-- large-file search results is followed by large_file.sync_quickfix, which
+-- runs on BufEnter/CursorMoved of each large-file buffer.

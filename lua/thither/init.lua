@@ -51,24 +51,35 @@ function M.large_edit(uri_or_path)
     return
   end
 
-  local client = Client.get(spec)
-  if not client:is_ready() then
-    local wait_ok = vim.wait(config.get("timeout_seconds", spec) * 1000, function()
-      return client:is_ready() or client.state == "error" or client.state == "closed"
-    end, 10)
-    if not wait_ok or not client:is_ready() then
-      vim.notify("Failed to connect to host: " .. spec, vim.log.levels.ERROR)
-      return
-    end
+  local client, cerr = Client.ensure(spec)
+  if not client then
+    vim.notify(string.format("Failed to connect to host %s: %s", spec, (cerr and cerr.msg) or "timeout"), vim.log.levels.ERROR)
+    return
   end
 
   local uri = string.format("thither://%s%s", spec, rpath)
   local bufnr = vim.fn.bufnr(uri, true)
+  if large_file.buffers[bufnr] then
+    vim.api.nvim_set_current_buf(bufnr)
+    return
+  end
+  local loaded = vim.api.nvim_buf_is_loaded(bufnr)
+  if not loaded then
+    -- BufReadCmd (fired when the buffer is loaded) opens it in large-file mode
+    buffer.force_large[bufnr] = true
+  end
   vim.api.nvim_set_current_buf(bufnr)
+  buffer.force_large[bufnr] = nil
 
-  local ok, err = large_file.open(bufnr, client, rpath, spec)
-  if not ok then
-    vim.notify(string.format("Failed to open in large file mode: %s", (err and err.msg) or "Unknown error"), vim.log.levels.ERROR)
+  if not large_file.buffers[bufnr] then
+    if loaded and vim.bo[bufnr].modified then
+      vim.notify("Buffer has unsaved changes; write or discard them first", vim.log.levels.ERROR)
+      return
+    end
+    local ok, err = large_file.open(bufnr, client, rpath, spec)
+    if not ok then
+      vim.notify(string.format("Failed to open in large file mode: %s", (err and err.msg) or "Unknown error"), vim.log.levels.ERROR)
+    end
   end
 end
 

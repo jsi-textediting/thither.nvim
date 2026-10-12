@@ -11,7 +11,7 @@ end
 
 local function run()
   print("Running test_vfs.lua...")
-  config.setup({ server_path = "./thither/build/thither-server" })
+  config.setup({ server_path = os.getenv("THITHER_SERVER") or "../thither/build/thither-server" })
   local client = Client.new("local:")
   local ready = false
   client:connect(function() ready = true end)

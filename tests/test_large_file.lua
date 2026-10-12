@@ -12,7 +12,7 @@ end
 local function run()
   print("Running test_large_file.lua...")
   config.setup({
-    server_path = "./thither/build/thither-server",
+    server_path = os.getenv("THITHER_SERVER") or "../thither/build/thither-server",
     chunk_size = 4096, -- Small chunk size so test file spans many chunks
     window_size_lines = 100,
   })
@@ -120,6 +120,40 @@ local function run()
   local conf_ok, conf_err = large_file.save(bufnr)
   assert_eq(conf_ok, false, "save fails due to conflict")
   assert_eq(conf_err.code, "conflict", "conflict error code returned")
+
+  -- 9. CRLF file against the real server: unmodified save is a no-op, an edit
+  -- keeps CRLF, and windows load correctly when read_range is split into
+  -- small requests and the window is capped by bytes.
+  local crlf_file = vim.fn.tempname()
+  local parts = {}
+  for i = 1, 3000 do parts[i] = string.format("crlf row %05d\r\n", i) end
+  local crlf_data = table.concat(parts)
+  local cf = io.open(crlf_file, "wb"); cf:write(crlf_data); cf:close()
+
+  local old_max = large_file.MAX_READ
+  large_file.MAX_READ = 1000
+  config.setup({ window_max_bytes = 1500 })
+  local cbuf = vim.api.nvim_create_buf(false, true)
+  local cok, cerr = large_file.open(cbuf, client, crlf_file, "local:")
+  if not cok then error("CRLF open failed: " .. vim.inspect(cerr)) end
+  local cstate = large_file.buffers[cbuf]
+  assert_eq(vim.bo[cbuf].fileformat, "dos", "CRLF window detected as dos")
+  assert_eq(cstate.window.end_line, 93, "window capped at 1500 bytes (16 bytes per line)")
+  assert_eq(large_file.goto_line(cbuf, 2500), true, "goto 2500")
+  local crow = 2500 - cstate.window.start_line
+  assert_eq(vim.api.nvim_buf_get_lines(cbuf, crow, crow + 1, false)[1], "crlf row 02500", "row content after split reads")
+  large_file.save(cbuf)
+  local rf2 = io.open(crlf_file, "rb"); local disk2 = rf2:read("*all"); rf2:close()
+  assert_eq(disk2, crlf_data, "unmodified CRLF window saved byte-identically")
+  vim.api.nvim_buf_set_lines(cbuf, crow, crow + 1, false, { "CRLF EDIT" })
+  local sok, serr = large_file.save(cbuf)
+  if not sok then error("CRLF save failed: " .. vim.inspect(serr)) end
+  rf2 = io.open(crlf_file, "rb"); disk2 = rf2:read("*all"); rf2:close()
+  assert_eq(disk2, (crlf_data:gsub("crlf row 02500\r\n", "CRLF EDIT\r\n")), "edit keeps CRLF, rest untouched")
+  large_file.MAX_READ = old_max
+  config.setup({ window_max_bytes = 4 * 1024 * 1024 })
+  vim.api.nvim_buf_delete(cbuf, { force = true })
+  os.remove(crlf_file)
 
   -- Cleanup
   os.remove(tmp_file)

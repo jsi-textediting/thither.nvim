@@ -4,8 +4,13 @@ local vfs = require("thither.vfs")
 local config = require("thither.config")
 local large_file = require("thither.large_file")
 local dir_browser = require("thither.dir_browser")
+local text_util = require("thither.text")
 
 local M = {}
+
+--- Buffers that :ThitherLargeEdit wants opened in large-file mode on their
+--- next BufReadCmd, whatever their size. bufnr -> true
+M.force_large = {}
 
 --- Parses a thither URI or path into (spec, remote_path).
 --- Examples:
@@ -50,6 +55,19 @@ function M.parse_uri(uri)
   return nil, nil
 end
 
+--- Connects (or reconnects) to `spec`, reporting failures.
+---@return table|nil client
+local function connect(spec)
+  local client, err = Client.ensure(spec)
+  if not client then
+    vim.notify(
+      string.format("Failed to connect to '%s': %s", spec, (err and err.msg) or "timeout"),
+      vim.log.levels.ERROR
+    )
+  end
+  return client
+end
+
 --- Handler for BufReadCmd thither://*
 ---@param bufnr integer
 ---@param uri string
@@ -60,19 +78,11 @@ function M.on_buf_read(bufnr, uri)
     return
   end
 
-  local client = Client.get(spec)
-  if not client:is_ready() then
-    local wait_ok = vim.wait(config.get("timeout_seconds", spec) * 1000, function()
-      return client:is_ready() or client.state == "error" or client.state == "closed"
-    end, 10)
-    if not wait_ok or not client:is_ready() then
-      vim.notify(
-        string.format("Failed to connect to '%s': %s", spec, (client.last_error and client.last_error.msg) or "timeout"),
-        vim.log.levels.ERROR
-      )
-      return
-    end
-  end
+  local client = connect(spec)
+  if not client then return end
+
+  local force_large = M.force_large[bufnr]
+  M.force_large[bufnr] = nil
 
   -- Query remote stat
   local st, err = vfs.stat(client, rpath)
@@ -80,6 +90,10 @@ function M.on_buf_read(bufnr, uri)
   if not st and err and err.code == "ENOENT" then
     -- Missing file: allow editing as new file
     vim.bo[bufnr].buftype = "acwrite"
+    vim.bo[bufnr].endofline = false
+    -- The remote host is POSIX: a new file gets LF line endings, not the
+    -- first 'fileformats' entry of the local system ("dos" on Windows).
+    vim.bo[bufnr].fileformat = "unix"
     vim.bo[bufnr].modified = false
     vim.b[bufnr].thither_spec = spec
     vim.b[bufnr].thither_rpath = rpath
@@ -99,7 +113,7 @@ function M.on_buf_read(bufnr, uri)
 
   -- Large file detection [PRIORITY]
   local threshold = config.get("large_file_threshold", spec) or (10 * 1024 * 1024)
-  if st.size >= threshold then
+  if force_large or st.size >= threshold then
     local ok, lerr = large_file.open(bufnr, client, rpath, spec)
     if not ok then
       vim.notify(
@@ -117,41 +131,14 @@ function M.on_buf_read(bufnr, uri)
     return
   end
 
-  local lines = {}
-  if #data == 0 then
-    lines = { "" }
-  else
-    local pos = 1
-    local data_len = #data
-    while pos <= data_len do
-      local nl = data:find("\n", pos, true)
-      if nl then
-        local line = data:sub(pos, nl - 1)
-        if line:sub(-1) == "\r" then line = line:sub(1, -2) end
-        table.insert(lines, line)
-        pos = nl + 1
-      else
-        local line = data:sub(pos)
-        if line:sub(-1) == "\r" then line = line:sub(1, -2) end
-        table.insert(lines, line)
-        break
-      end
-    end
-  end
-
-  local old_undo = vim.bo[bufnr].undolevels
-  vim.bo[bufnr].undolevels = -1
+  local lines, ff, eol = text_util.split(data)
   vim.bo[bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
-  vim.bo[bufnr].undolevels = old_undo
+  vim.bo[bufnr].fileformat = ff
+  vim.bo[bufnr].endofline = eol
+  text_util.set_lines_no_undo(bufnr, lines)
 
   vim.bo[bufnr].buftype = "acwrite"
   vim.bo[bufnr].modified = false
-  if data:find("\r\n", 1, true) then
-    vim.bo[bufnr].fileformat = "dos"
-  else
-    vim.bo[bufnr].fileformat = "unix"
-  end
 
   vim.b[bufnr].thither_spec = spec
   vim.b[bufnr].thither_rpath = rpath
@@ -164,41 +151,136 @@ function M.on_buf_read(bufnr, uri)
   end)
 end
 
---- Handler for BufWriteCmd thither://*
+--- Handler for FileReadCmd thither://* (":[N]read thither://..."): inserts the
+--- remote file below line '[ of the current buffer, which keeps its options
+--- and variables. Like netrw, ":0read" inserts below line 1 because Vim sets
+--- '[ to 1 for both.
+---@param uri string
+function M.on_file_read(uri)
+  local spec, rpath = M.parse_uri(uri)
+  if not spec or not rpath then
+    vim.notify("Invalid thither URI: " .. uri, vim.log.levels.ERROR)
+    return
+  end
+  local client = connect(spec)
+  if not client then return end
+
+  local st, err = vfs.stat(client, rpath)
+  if not st then
+    vim.notify(string.format("Failed to read '%s:%s': %s", spec, rpath, err and err.msg or "unknown error"), vim.log.levels.ERROR)
+    return
+  end
+  if st.type == "dir" then
+    vim.notify(string.format("'%s:%s' is a directory", spec, rpath), vim.log.levels.ERROR)
+    return
+  end
+  local threshold = config.get("large_file_threshold", spec) or (10 * 1024 * 1024)
+  if st.size >= threshold then
+    vim.notify(string.format("'%s:%s' is too large for :read (%d bytes)", spec, rpath, st.size), vim.log.levels.ERROR)
+    return
+  end
+
+  local data, _, rerr = vfs.read_all(client, rpath)
+  if not data then
+    vim.notify(string.format("Failed to read '%s': %s", rpath, (rerr and rerr.msg) or "unknown error"), vim.log.levels.ERROR)
+    return
+  end
+  if data == "" then return end
+
+  local lines = text_util.split(data)
+  local after = vim.fn.line("'[")
+  local count = vim.api.nvim_buf_line_count(0)
+  after = math.max(0, math.min(after, count))
+  vim.api.nvim_buf_set_lines(0, after, after, false, lines)
+  pcall(vim.api.nvim_buf_set_mark, 0, "[", after + 1, 0, {})
+  pcall(vim.api.nvim_buf_set_mark, 0, "]", after + #lines, 0, {})
+end
+
+--- True when two URIs name the same remote file.
+local function same_target(spec_a, rpath_a, spec_b, rpath_b)
+  return spec_a ~= nil and spec_a == spec_b and rpath_a == rpath_b
+end
+
+--- Handler for BufWriteCmd / FileWriteCmd thither://*.
+--- Writes to the name the command was given (`target`, <amatch>) and, for
+--- FileWriteCmd, only the lines '[ .. '] of the buffer.
 ---@param bufnr integer
-function M.on_buf_write(bufnr)
-  -- 1. Check if handled by large file subsystem
-  if large_file.buffers[bufnr] then
-    large_file.save(bufnr)
+---@param target string
+---@param event? string "BufWriteCmd" | "FileWriteCmd"
+function M.on_write(bufnr, target, event)
+  local tspec, trpath = M.parse_uri(target or "")
+  if not tspec or not trpath then
+    vim.notify("Invalid thither URI: " .. tostring(target), vim.log.levels.ERROR)
+    return
+  end
+
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  local first, last = 1, line_count
+  if event == "FileWriteCmd" then
+    first, last = vim.fn.line("'["), vim.fn.line("']")
+  end
+  local whole = first == 1 and last == line_count
+  local bang = vim.v.cmdbang == 1
+
+  -- Is the target the buffer's own name? (":w", ":saveas new" renames the buffer first)
+  local bspec, brpath = M.parse_uri(vim.api.nvim_buf_get_name(bufnr))
+  local own = same_target(tspec, trpath, bspec, brpath)
+
+  -- 1. Large file buffers
+  local lstate = large_file.buffers[bufnr]
+  if lstate then
+    if not whole then
+      vim.notify("Partial writes are not supported in large-file buffers", vim.log.levels.ERROR)
+      return
+    end
+    if own and same_target(tspec, trpath, lstate.spec, lstate.rpath) then
+      large_file.save(bufnr)
+    else
+      large_file.save_as(bufnr, tspec, trpath, { overwrite = bang, switch = own })
+    end
     return
   end
 
   -- 2. Normal file write
-  local spec = vim.b[bufnr].thither_spec
-  local rpath = vim.b[bufnr].thither_rpath
-  local etag = vim.b[bufnr].thither_etag
-
-  if not spec or not rpath then
-    vim.notify("Buffer is missing thither remote metadata", vim.log.levels.ERROR)
+  if own and not whole and not bang then
+    vim.notify("E140: Use ! to write partial buffer", vim.log.levels.ERROR)
     return
   end
 
-  local client = Client.get(spec)
-  if not client:is_ready() then
-    vim.notify("Client is not ready to write", vim.log.levels.ERROR)
-    return
+  local client = connect(tspec)
+  if not client then return end
+
+  -- The file this buffer was read from (if any) and its etag.
+  local tracked = same_target(tspec, trpath, vim.b[bufnr].thither_spec, vim.b[bufnr].thither_rpath)
+  local if_match
+  if bang then
+    -- ":w!" writes even when the file changed on the host since it was read
+    if_match = nil
+  elseif tracked then
+    -- etag of the version we read; "-" for a file that did not exist
+    if_match = vim.b[bufnr].thither_etag or "-"
+  else
+    if_match = "-" -- like Vim: do not overwrite an existing file without !
   end
 
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  local sep = vim.bo[bufnr].fileformat == "dos" and "\r\n" or "\n"
-  local eol = (vim.bo[bufnr].endofline ~= false) and sep or ""
-  local data = table.concat(lines, sep) .. eol
+  local lines = vim.api.nvim_buf_get_lines(bufnr, first - 1, last, false)
+  local ff = vim.bo[bufnr].fileformat
+  local data
+  if last < line_count then
+    data = text_util.join(lines, ff, true)
+  elseif whole and #lines == 1 and lines[1] == "" and not vim.bo[bufnr].endofline then
+    data = "" -- empty buffer, empty file
+  else
+    data = text_util.join(lines, ff, text_util.want_eol(bufnr))
+  end
 
-  local res, err = vfs.write(client, rpath, data, etag, nil, true)
+  local res, err = vfs.write(client, trpath, data, if_match, nil, true)
   if not res then
-    if err and err.code == "conflict" then
+    if err and err.code == "conflict" and if_match == "-" then
+      vim.notify(string.format("E13: File exists (add ! to override): %s:%s", tspec, trpath), vim.log.levels.ERROR)
+    elseif err and err.code == "conflict" then
       vim.notify(
-        string.format("Conflict! File on host changed (current etag: %s).", tostring(err.etag)),
+        string.format("Conflict! File on host changed (current etag: %s); :w! to overwrite, :e! to reload.", tostring(err.etag)),
         vim.log.levels.ERROR
       )
     else
@@ -210,9 +292,25 @@ function M.on_buf_write(bufnr)
     return
   end
 
-  vim.b[bufnr].thither_etag = res.etag
-  vim.bo[bufnr].modified = false
-  vim.notify(string.format("Saved %s:%s (etag: %s)", spec, rpath, res.etag), vim.log.levels.INFO)
+  if own then
+    vim.b[bufnr].thither_spec = tspec
+    vim.b[bufnr].thither_rpath = trpath
+    vim.b[bufnr].thither_etag = res.etag
+    if whole then
+      vim.bo[bufnr].buftype = "acwrite"
+      vim.bo[bufnr].modified = false
+    end
+  elseif tracked then
+    -- partial or renamed write over the tracked file: remember its new etag
+    vim.b[bufnr].thither_etag = res.etag
+  end
+  vim.notify(string.format("Written %s:%s (%d lines, etag: %s)", tspec, trpath, #lines, res.etag), vim.log.levels.INFO)
+end
+
+--- Backwards compatible entry point: writes the whole buffer to its own name.
+---@param bufnr integer
+function M.on_buf_write(bufnr)
+  M.on_write(bufnr, vim.api.nvim_buf_get_name(bufnr), "BufWriteCmd")
 end
 
 return M
